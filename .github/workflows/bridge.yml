@@ -1,25 +1,8 @@
 name: Bridge CI
 
 on:
-  push:
-    branches: [master, main]
-    paths:
-      - 'circuits/bridge.circom'
-      - 'circuits/evm_verifier.circom'
-      - 'contracts/bridge/**'
-      - 'backend/src/routes/bridge.ts'
-      - 'backend/src/services/bridge.ts'
-      - 'tests/bridge/**'
-      - '.github/workflows/bridge.yml'
-  pull_request:
-    paths:
-      - 'circuits/bridge.circom'
-      - 'circuits/evm_verifier.circom'
-      - 'contracts/bridge/**'
-      - 'backend/src/routes/bridge.ts'
-      - 'backend/src/services/bridge.ts'
-      - 'tests/bridge/**'
-
+  # Personal fork: manual-only to avoid automatic CI notifications.
+  workflow_dispatch: {}
 jobs:
   bridge-circuits:
     name: Bridge Circuits

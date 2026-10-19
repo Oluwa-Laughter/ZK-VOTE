@@ -1,13 +1,8 @@
 name: Formal Model Check
 
 on:
-  pull_request:
-  push:
-    branches: [master, main]
-    paths:
-      - 'formal-model/**'
-      - '.github/workflows/formal-model.yml'
-
+  # Personal fork: manual-only to avoid automatic CI notifications.
+  workflow_dispatch: {}
 jobs:
   tlc-check:
     name: TLC Model Checker

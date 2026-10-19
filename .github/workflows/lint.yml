@@ -1,11 +1,8 @@
 name: Lint and Security Checks
 
 on:
-  push:
-    branches: [main, develop]
-  pull_request:
-    branches: [main]
-
+  # Personal fork: manual-only to avoid automatic CI notifications.
+  workflow_dispatch: {}
 jobs:
   lint:
     runs-on: ubuntu-latest

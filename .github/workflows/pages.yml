@@ -1,8 +1,6 @@
 name: deploy-pages
 on:
-  push:
-    branches: [main]
-    paths: ['frontend/**', '.github/workflows/pages.yml']
+  # Personal fork: manual-only to avoid automatic CI notifications.
   workflow_dispatch:
 permissions:
   contents: read

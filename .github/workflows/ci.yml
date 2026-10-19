@@ -1,10 +1,8 @@
 name: CI
 
 on:
-  push:
-    branches: [master, main]
-  pull_request:
-
+  # Personal fork: manual-only to avoid automatic CI notifications.
+  workflow_dispatch: {}
 jobs:
   contracts:
     name: Rust Contracts
