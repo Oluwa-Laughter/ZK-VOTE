@@ -33,7 +33,7 @@ declare global {
 }
 import crypto from "crypto";
 import { config } from "../config.js";
-import { log, hashIp, getRedactionPolicy } from "../services/logger.js";
+import { log, hashIp, getRedactionPolicy, runWithContext } from "../services/logger.js";
 import {
   createSpanContext,
   formatTraceparent,
@@ -149,6 +149,18 @@ const SENSITIVE_FIELDS = new Set(
     "session",
     "apikey",
     "api_key",
+    // Vote anonymity fields (#644)
+    "choice",
+    "votechoice",
+    "walletaddress",
+    "wallet_address",
+    "voterpublickey",
+    "voter_public_key",
+    "votersignature",
+    "voter_signature",
+    "publickey",
+    "signature",
+    "idempotencykey",
   ].map(normalizeFieldKey),
 );
 
@@ -264,8 +276,8 @@ const ROUTE_SAMPLING_OVERRIDES: Array<{
   rate: number;
   alwaysLogBody: boolean;
 }> = [
-  // /vote endpoints always log at full rate with body
-  { pattern: /^\/vote/, rate: 1.0, alwaysLogBody: true },
+  // /vote must never log bodies — choice + identity fields destroy anonymity (#644)
+  { pattern: /^\/vote/, rate: 1.0, alwaysLogBody: false },
   // /comment endpoints log at higher rate
   { pattern: /^\/comment/, rate: 0.5, alwaysLogBody: false },
   // /health at low rate (noisy)
@@ -280,6 +292,8 @@ const ROUTE_SAMPLING_OVERRIDES: Array<{
   { pattern: /^\/ipfs/, rate: 0.2, alwaysLogBody: false },
   // /daos at moderate rate
   { pattern: /^\/daos/, rate: 0.1, alwaysLogBody: false },
+  // /bridge votes — never log bodies
+  { pattern: /^\/bridge\/vote/, rate: 1.0, alwaysLogBody: false },
 ];
 
 /**
@@ -314,11 +328,12 @@ function shouldSample(
 
 /**
  * Check if a route has body logging enabled.
+ * Route overrides win: alwaysLogBody:false forces no body for that path (#644).
  */
 function shouldLogBody(path: string): boolean {
   for (const override of ROUTE_SAMPLING_OVERRIDES) {
-    if (override.pattern.test(path) && override.alwaysLogBody) {
-      return true;
+    if (override.pattern.test(path)) {
+      return override.alwaysLogBody;
     }
   }
   return config.logRequestBody;
@@ -491,7 +506,12 @@ export function requestLogger(
   // never request bodies, config, or secrets — so exporters cannot leak
   // RELAYER_SECRET_KEY / blindingFactor through trace attributes.
   const spanContext: SpanContext = { traceId, spanId, traceFlags: "01" };
-  runWithSpanContext(spanContext, next);
+  // Also open the log-correlation context, so every log written while
+  // handling this request (including metric_drilldown records, #749)
+  // carries ctx + traceId — the metric → log → trace join key.
+  runWithContext({ ctx, traceId, path: req.path, method: req.method }, () =>
+    runWithSpanContext(spanContext, next),
+  );
 }
 
 /**

@@ -24,6 +24,12 @@ vi.mock("../lib/client", () => ({
       get_leaf_index: vi.fn().mockResolvedValue({ result: 0 }),
       current_root: vi.fn().mockResolvedValue({ result: BigInt("12345") }),
     },
+    // The component reads the circuit's `numCandidates` public signal from the
+    // contract before building the witness (it is a required circuit input, not
+    // an optional one — the circuit constrains `voteChoice < numCandidates`).
+    voting: {
+      get_effective_num_candidates: vi.fn().mockResolvedValue({ result: 2 }),
+    },
   })),
 }));
 
@@ -83,8 +89,75 @@ vi.mock("../lib/zk", () => ({
   storeZKCredentials: vi.fn(),
 }));
 
+vi.mock("../lib/circuitDepth", () => ({
+  resolveCircuitUrls: vi.fn().mockReturnValue({
+    wasmUrl: "/circuits/vote.wasm",
+    zkeyUrl: "/circuits/vote_final.zkey",
+  }),
+}));
+
+vi.mock("../queries/proposalQueries", () => ({
+  useOptimisticVote: () => ({
+    setOptimisticVote: vi.fn(() => vi.fn()),
+    clearPendingVote: vi.fn(),
+  }),
+}));
+
+vi.mock("../hooks/useReceipts", () => ({
+  useReceipts: () => ({ addReceipt: vi.fn() }),
+}));
+
+const mockProcessEntry = vi.fn();
+vi.mock("../lib/queueProcessor", () => ({
+  processEntry: (...args: unknown[]) => mockProcessEntry(...args),
+}));
+
+const queueEntries: Record<string, { status: string; txHash: string | null; conflictDetail: string | null; lastError: string | null }> = {};
+
+vi.mock("../store/submissionQueue", async () => {
+  const actual = await vi.importActual<typeof import("../store/submissionQueue")>(
+    "../store/submissionQueue",
+  );
+  return {
+    ...actual,
+    submissionQueue: {
+      ...actual.submissionQueue,
+      enqueue: vi.fn((payload: { nullifier: string }) => {
+        const entry = {
+          id: payload.nullifier,
+          payload,
+          status: "pending" as const,
+          attempts: 0,
+          enqueuedAt: Date.now(),
+          lastAttemptAt: null,
+          retryAfter: null,
+          lastError: null,
+          conflictDetail: null,
+          txHash: null,
+        };
+        queueEntries[payload.nullifier] = entry;
+        return entry;
+      }),
+      getState: vi.fn(() => ({ entries: queueEntries })),
+    },
+  };
+});
+
 // Mock fetch for relay submission
 global.fetch = vi.fn();
+
+// Every test starts with the voter's wallet connected on the app's network
+// (#750): VoteModal refuses to build a proof for any other session.
+import {
+  APP_NETWORK_PASSPHRASE,
+  __resetWalletSession,
+  walletSession,
+} from "../lib/walletSession";
+
+beforeEach(() => {
+  __resetWalletSession();
+  walletSession.sync("GDTEST...", APP_NETWORK_PASSPHRASE);
+});
 
 describe("VoteModal", () => {
   const defaultProps = {
@@ -101,6 +174,16 @@ describe("VoteModal", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    Object.keys(queueEntries).forEach((k) => delete queueEntries[k]);
+    mockProcessEntry.mockImplementation(async (entry: { id: string }) => {
+      queueEntries[entry.id] = {
+        ...queueEntries[entry.id],
+        status: "submitted",
+        txHash: "abc123",
+        conflictDetail: null,
+        lastError: null,
+      };
+    });
     (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       json: () => Promise.resolve({ txHash: "abc123" }),
@@ -192,6 +275,33 @@ describe("VoteModal", () => {
     fireEvent.click(xButton);
 
     expect(defaultProps.onClose).toHaveBeenCalled();
+  });
+
+  it("calls onClose when Escape is pressed", () => {
+    renderWithQueryClient(<VoteModal {...defaultProps} />);
+
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    expect(defaultProps.onClose).toHaveBeenCalled();
+  });
+
+  it("blocks the vote before proving when the relayer is on another network", async () => {
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(["relayer", "status"], {
+      status: { state: "mismatch", message: "m", mismatches: ["passphrase"], wrongNetwork: true },
+      relayerConfig: null,
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <VoteModal {...defaultProps} />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByText("Vote Yes"));
+
+    await vi.waitFor(() => {
+      expect(screen.getByText(/different Stellar network/)).toBeInTheDocument();
+    });
   });
 
   it("shows generating state after clicking Vote Yes", async () => {
@@ -292,33 +402,34 @@ describe("VoteModal error handling", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    Object.keys(queueEntries).forEach((k) => delete queueEntries[k]);
+    mockProcessEntry.mockImplementation(async (entry: { id: string }) => {
+      queueEntries[entry.id] = {
+        ...queueEntries[entry.id],
+        status: "failed",
+        txHash: null,
+        conflictDetail: null,
+        lastError: "Network error",
+      };
+    });
   });
 
-  it("shows optimistic vote submission step when vote is cast", async () => {
-    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
-      ok: false,
-      json: () => Promise.resolve({ error: "Network error" }),
-    });
-
+  it("shows error when relay rejects the vote", async () => {
     renderWithQueryClient(<VoteModal {...defaultProps} />);
 
     fireEvent.click(screen.getByText("Vote Yes"));
 
-    expect(await screen.findByText("Vote Submitted!")).toBeInTheDocument();
+    expect(await screen.findByText("Error")).toBeInTheDocument();
+    expect(screen.getByText(/Network error/i)).toBeInTheDocument();
   });
 
   it("provides Close button in error state", async () => {
-    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
-      ok: false,
-      json: () => Promise.resolve({ error: "Some error" }),
-    });
-
     renderWithQueryClient(<VoteModal {...defaultProps} />);
 
     fireEvent.click(screen.getByText("Vote Yes"));
 
-    // Optimistic UI immediately transitions to success step
-    expect(await screen.findByText("Vote Submitted!")).toBeInTheDocument();
+    expect(await screen.findByText("Error")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /close|done/i })).toBeInTheDocument();
   });
 });
 
@@ -337,6 +448,16 @@ describe("VoteModal success state", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    Object.keys(queueEntries).forEach((k) => delete queueEntries[k]);
+    mockProcessEntry.mockImplementation(async (entry: { id: string }) => {
+      queueEntries[entry.id] = {
+        ...queueEntries[entry.id],
+        status: "submitted",
+        txHash: "abc123",
+        conflictDetail: null,
+        lastError: null,
+      };
+    });
     (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
       ok: true,
       json: () => Promise.resolve({ txHash: "abc123" }),
@@ -352,7 +473,7 @@ describe("VoteModal success state", () => {
 
     fireEvent.click(screen.getByText("Vote Yes"));
 
-    // Should eventually show success
+    // Should eventually show success only after processEntry resolves
     expect(await screen.findByText("Vote Submitted!")).toBeInTheDocument();
   });
 
@@ -499,5 +620,129 @@ describe("VoteModal panic-mode (coercion resistance, issue #337)", () => {
     await vi.waitFor(() => {
       expect(getZKCredentials).toHaveBeenCalled();
     });
+  });
+});
+
+// ── Wallet interruptions (#750) ─────────────────────────────────────────────
+
+describe("VoteModal wallet interruptions (#750)", () => {
+  const defaultProps = {
+    proposalId: 1,
+    eligibleRoot: BigInt("12345"),
+    voteMode: "Fixed" as const,
+    vkVersion: 1,
+    daoId: 1,
+    numCandidates: 2,
+    publicKey: "GDTEST...",
+    kit: null,
+    onClose: vi.fn(),
+    onComplete: vi.fn(),
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    Object.keys(queueEntries).forEach((k) => delete queueEntries[k]);
+    mockProcessEntry.mockImplementation(async (entry: { id: string }) => {
+      queueEntries[entry.id] = {
+        ...queueEntries[entry.id],
+        status: "submitted",
+        txHash: "abc123",
+        conflictDetail: null,
+        lastError: null,
+      };
+    });
+  });
+
+  it("blocks at build time when the wallet is on another network", async () => {
+    const { generateVoteProof } = await import("../lib/zkproof");
+    walletSession.sync("GDTEST...", "Test SDF Future Network ; October 2022");
+
+    renderWithQueryClient(<VoteModal {...defaultProps} />);
+    fireEvent.click(screen.getByText("Vote Yes"));
+
+    expect(await screen.findByText(/Your wallet is on futurenet, but this app uses testnet/)).toBeInTheDocument();
+    expect(generateVoteProof).not.toHaveBeenCalled();
+    expect(mockProcessEntry).not.toHaveBeenCalled();
+  });
+
+  it("refuses to start for an account that is no longer connected", async () => {
+    const { generateVoteProof } = await import("../lib/zkproof");
+    walletSession.sync("GOTHER...", APP_NETWORK_PASSPHRASE);
+
+    renderWithQueryClient(<VoteModal {...defaultProps} />);
+    fireEvent.click(screen.getByText("Vote Yes"));
+
+    expect(await screen.findByText(/Your wallet switched to/)).toBeInTheDocument();
+    expect(generateVoteProof).not.toHaveBeenCalled();
+  });
+
+  it("aborts before proving when the wallet disconnects mid-flow; nothing is queued", async () => {
+    const { generateVoteProof } = await import("../lib/zkproof");
+    const { getMerklePath } = await import("../lib/merkletree");
+    const { submissionQueue } = await import("../store/submissionQueue");
+    vi.mocked(getMerklePath).mockImplementationOnce(async () => {
+      walletSession.end();
+      return { pathElements: ["0", "1", "2"], pathIndices: [0, 1, 0] };
+    });
+
+    renderWithQueryClient(<VoteModal {...defaultProps} />);
+    fireEvent.click(screen.getByText("Vote Yes"));
+
+    expect(await screen.findByText(/disconnected before your vote was ready. Nothing was submitted/)).toBeInTheDocument();
+    expect(generateVoteProof).not.toHaveBeenCalled();
+    expect(submissionQueue.enqueue).not.toHaveBeenCalled();
+  });
+
+  it("holds a proof finished after an account switch, bound to the original account", async () => {
+    const { generateVoteProof } = await import("../lib/zkproof");
+    const { submissionQueue } = await import("../store/submissionQueue");
+    const { accountTag } = await import("../lib/walletSession");
+    const real = vi.mocked(generateVoteProof).getMockImplementation()!;
+    vi.mocked(generateVoteProof).mockImplementationOnce(async (...args) => {
+      walletSession.sync("GATTACKER...", APP_NETWORK_PASSPHRASE);
+      return real(...args);
+    });
+
+    renderWithQueryClient(<VoteModal {...defaultProps} />);
+    fireEvent.click(screen.getByText("Vote Yes"));
+
+    expect(await screen.findByTestId("vote-held")).toBeInTheDocument();
+    expect(screen.getByText(/switched accounts while your proof was being generated/)).toBeInTheDocument();
+    // Saved for GDTEST..., never submitted from the new account.
+    const [, binding] = vi.mocked(submissionQueue.enqueue).mock.calls[0];
+    expect(binding?.accountTag).toBe(await accountTag("GDTEST..."));
+    expect(mockProcessEntry).not.toHaveBeenCalled();
+    expect(defaultProps.onComplete).not.toHaveBeenCalled();
+  });
+
+  it("holds a proof finished after a network switch", async () => {
+    const { generateVoteProof } = await import("../lib/zkproof");
+    const real = vi.mocked(generateVoteProof).getMockImplementation()!;
+    vi.mocked(generateVoteProof).mockImplementationOnce(async (...args) => {
+      walletSession.sync("GDTEST...", "Public Global Stellar Network ; September 2015");
+      return real(...args);
+    });
+
+    renderWithQueryClient(<VoteModal {...defaultProps} />);
+    fireEvent.click(screen.getByText("Vote Yes"));
+
+    expect(await screen.findByText(/switched networks while your proof was being generated/)).toBeInTheDocument();
+    expect(mockProcessEntry).not.toHaveBeenCalled();
+  });
+
+  it("continues when the same account reconnects during the proof (lock/unlock)", async () => {
+    const { generateVoteProof } = await import("../lib/zkproof");
+    const real = vi.mocked(generateVoteProof).getMockImplementation()!;
+    vi.mocked(generateVoteProof).mockImplementationOnce(async (...args) => {
+      walletSession.end();
+      walletSession.sync("GDTEST...", APP_NETWORK_PASSPHRASE);
+      return real(...args);
+    });
+
+    renderWithQueryClient(<VoteModal {...defaultProps} />);
+    fireEvent.click(screen.getByText("Vote Yes"));
+
+    expect(await screen.findByText("Vote Submitted!")).toBeInTheDocument();
+    expect(mockProcessEntry).toHaveBeenCalledTimes(1);
   });
 });

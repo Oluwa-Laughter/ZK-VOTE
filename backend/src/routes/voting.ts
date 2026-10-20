@@ -18,11 +18,14 @@ import { config } from "../config.js";
 import { log } from "../services/logger.js";
 import {
   server,
+  rpcPoolManager,
   relayerKeypair,
   callWithTimeout,
   simulateWithBackoff,
   waitForTransaction,
   withSequenceLock,
+  acquireSequenceLockForSubmit,
+  releaseLockForConfirmation,
   sequenceManager,
   submitVoteViaRelayerQuorum,
   scheduleCoverTraffic,
@@ -36,7 +39,11 @@ import {
   canonicalizeProof,
 } from "../services/stellar.js";
 import {
-  authGuard,
+  EndpointDisagreementError,
+  StaleReadError,
+} from "../services/endpoint-pool.js";
+import {
+  anonymousGuard,
   tlsClientCertGuard,
   voteLimiter,
   walletRateLimiter,
@@ -86,11 +93,19 @@ import {
   relayDuration,
   relayErrors,
   relayQueueDepth,
+  offlineRetryTotal,
+  rootFetchFailuresTotal,
 } from "../services/metrics.js";
+import { incWithDrilldown } from "../services/metric-drilldown.js";
 import { sharedSingleFlight } from "../utils/singleflight.js";
+import { voteSessionGuard } from "../middleware/voteSession.js";
+import voteSessionRoutes from "./voteSession.js";
 import type { Groth16Proof } from "../types/index.js";
 
 const router = Router();
+
+// Wallet-session binding for /vote (#750)
+router.use(voteSessionRoutes);
 
 if (!config.testMode) {
   scheduleCoverTraffic();
@@ -132,8 +147,6 @@ interface VoteQueuedPayload {
   proof: unknown;
   nonce?: string;
   timestamp?: number;
-  voterPublicKey?: string;
-  voterSignature?: string;
 }
 
 interface VoteQueueJob {
@@ -248,7 +261,11 @@ async function executeQueuedVoteJob(payload: VoteQueuedPayload): Promise<{
   ];
   const operation = contract.call("vote", ...args);
 
-  const { sendResult, result } = await withSequenceLock(async () => {
+  // Acquire lock only for sequence-sensitive operations (build & submit),
+  // then release before blocking on confirmation (#656)
+  await acquireSequenceLockForSubmit();
+  let sendResult: any;
+  try {
     const account = await (server as StellarSdk.rpc.Server).getAccount(
       relayerKeypair.publicKey(),
     );
@@ -276,16 +293,16 @@ async function executeQueuedVoteJob(payload: VoteQueuedPayload): Promise<{
       .assembleTransaction(tx, simResult)
       .build();
     preparedTx.sign(relayerKeypair as StellarSdk.Keypair);
-    const sr = await callWithTimeout(
+    sendResult = await callWithTimeout(
       () => (server as StellarSdk.rpc.Server).sendTransaction(preparedTx),
       "send_vote",
     );
 
-    if (sr.status === "ERROR") {
+    if (sendResult.status === "ERROR") {
       const isBadSeq = sequenceManager.handleTxError(
-        typeof (sr as any).errorResult === "string"
-          ? (sr as any).errorResult
-          : JSON.stringify((sr as any).errorResult ?? ""),
+        typeof (sendResult as any).errorResult === "string"
+          ? (sendResult as any).errorResult
+          : JSON.stringify((sendResult as any).errorResult ?? ""),
       );
       if (nullifier) {
         updateTransactionLogStatus(nullifier, "FAILED");
@@ -294,17 +311,18 @@ async function executeQueuedVoteJob(payload: VoteQueuedPayload): Promise<{
       throw new Error(isBadSeq ? "SUBMIT_FAILED_BAD_SEQ" : "SUBMIT_FAILED");
     }
 
-    if (nullifier && sr.hash) {
-      recordTransactionLog(nullifier, sr.hash, "PENDING");
+    if (nullifier && sendResult.hash) {
+      recordTransactionLog(nullifier, sendResult.hash, "PENDING");
     }
+  } finally {
+    releaseLockForConfirmation();
+  }
 
-    const r = await callWithTimeout(
-      () => waitForTransaction(sr.hash),
-      "wait_for_vote",
-    );
-
-    return { sendResult: sr, result: r };
-  });
+  // Confirmation happens without lock held, allowing other requests to progress
+  const result = await callWithTimeout(
+    () => waitForTransaction(sendResult.hash),
+    "wait_for_vote",
+  );
 
   if (result.status === "SUCCESS") {
     if (nullifier && sendResult.hash) {
@@ -568,7 +586,7 @@ router.get("/relayer/pubkey", (_req: Request, res: Response) => {
 router.post(
   "/vote/commit",
   bodyLimit("5kb"),
-  authGuard,
+  anonymousGuard,
   tlsClientCertGuard,
   walletRateLimiter,
   validateBody(commitSchema),
@@ -579,7 +597,6 @@ router.post(
       nullifier,
       commitmentHash,
       timestamp,
-      walletAddress,
       proof,
     } = req.body;
 
@@ -609,19 +626,18 @@ router.post(
         .json({ error: "Proof commitment already revealed" });
     }
 
+    // Do not store client-supplied wallet addresses or plaintext nullifiers (#644)
     recordProofCommitment(
       commitmentHash,
       nullifier,
       daoId,
       proposalId,
       timestamp,
-      walletAddress,
     );
 
     log("info", "proof_committed", {
       daoId,
       proposalId,
-      nullifier,
       commitmentHash,
     });
 
@@ -639,11 +655,12 @@ router.post(
 router.post(
   "/vote",
   bodyLimit("5kb"),
-  authGuard,
+  anonymousGuard,
   tlsClientCertGuard,
   walletRateLimiter,
   voteLimiter,
   validateBody(voteSchema),
+  voteSessionGuard,
   (async (req: Request, res: Response, next: NextFunction) => {
     let body = config.stripRequestBodies ? {} : req.body;
 
@@ -667,101 +684,48 @@ router.post(
       redundantProof,
       nonce,
       timestamp,
-      voterPublicKey,
-      voterSignature,
     } = body;
 
     const idempotencyKey = req.header("Idempotency-Key") || nullifier;
 
+    if (req.header("X-Offline-Retry")) {
+      offlineRetryTotal.inc({ type: "vote", status: "attempt" });
+    }
+
+    // Check if nullifier has already been recorded/confirmed (idempotency check for offline retries)
+    const existingReceipt = nullifier ? getVoteReceipt(nullifier) : null;
+    if (
+      existingReceipt &&
+      existingReceipt.dao_id === daoId &&
+      existingReceipt.proposal_id === proposalId
+    ) {
+      log("info", "vote_nullifier_already_used", {
+        nullifier,
+        txHash: existingReceipt.tx_hash,
+        daoId,
+        proposalId,
+      });
+      offlineRetryTotal.inc({ type: "vote", status: "conflict" });
+      return res.status(409).json({
+        ok: false,
+        error: "Nullifier already used: vote already recorded",
+        status: "CONFLICT",
+        receipt: {
+          nullifier: existingReceipt.nullifier,
+          txHash: existingReceipt.tx_hash,
+          proposalId: existingReceipt.proposal_id,
+          daoId: existingReceipt.dao_id,
+          status: existingReceipt.status,
+          createdAt: existingReceipt.created_at,
+        },
+      });
+    }
+
     try {
       log("info", "vote_request", { daoId, proposalId });
 
-      // Verify voter signature if provided
-      if (voterPublicKey && voterSignature) {
-        try {
-          const payloadToSign = JSON.stringify({
-            daoId,
-            proposalId,
-            choice,
-            nullifier,
-            root,
-            proof,
-            timestamp,
-          });
-          const payloadHash = StellarSdk.hash(
-            Buffer.from(payloadToSign, "utf8"),
-          );
-
-          // Re-build the same minimal ManageData transaction the frontend constructed
-          const account = new StellarSdk.Account(voterPublicKey, "0");
-          const tx = new StellarSdk.TransactionBuilder(account, {
-            fee: "100",
-            networkPassphrase: config.networkPassphrase,
-          })
-            .addOperation(
-              StellarSdk.Operation.manageData({
-                name: "vote_sig",
-                value: payloadHash.slice(0, 28),
-              }),
-            )
-            .setTimeout(0)
-            .build();
-
-          // Parse the signed XDR the frontend returned
-          const signedTx = new StellarSdk.Transaction(
-            voterSignature,
-            config.networkPassphrase,
-          );
-
-          // Verify the transaction hash matches what we expect
-          const expectedHash = tx.hash();
-          const actualHash = signedTx.hash();
-          if (!expectedHash.equals(actualHash)) {
-            log("warn", "voter_signature_tx_mismatch", {
-              voterPublicKey,
-              daoId,
-              proposalId,
-            });
-            return res
-              .status(400)
-              .json({ error: "Voter signature does not match vote payload" });
-          }
-
-          // Verify the ed25519 signature on the transaction hash
-          if (signedTx.signatures.length === 0) {
-            return res
-              .status(400)
-              .json({ error: "Voter signature is missing" });
-          }
-
-          const keypair = StellarSdk.Keypair.fromPublicKey(voterPublicKey);
-          const sig = signedTx.signatures[0].signature();
-          const isValid = keypair.verify(actualHash, sig);
-
-          if (!isValid) {
-            log("warn", "invalid_voter_signature", {
-              voterPublicKey,
-              daoId,
-              proposalId,
-            });
-            return res.status(400).json({ error: "Invalid voter signature" });
-          }
-
-          log("info", "voter_signature_verified", {
-            voterPublicKey,
-            daoId,
-            proposalId,
-          });
-        } catch (err) {
-          log("warn", "voter_signature_verification_failed", {
-            error: (err as Error).message,
-            voterPublicKey,
-          });
-          return res
-            .status(400)
-            .json({ error: "Voter signature verification failed" });
-        }
-      }
+      // Identity signatures (voterPublicKey / voterSignature) are intentionally
+      // not accepted — they deanonymize the ZK vote in transit (#644).
 
       await rejectOnRedundantProofMismatch({
         daoId,
@@ -806,7 +770,9 @@ router.post(
       try {
         cleanupExpiredVoteSubmissions(120000);
       } catch (err) {
-        log("warn", "cleanup_expired_vote_submissions_failed", { error: (err as Error).message });
+        log("warn", "cleanup_expired_vote_submissions_failed", {
+          error: (err as Error).message,
+        });
       }
 
       // Idempotency: check vote_submissions table keyed on idempotencyKey
@@ -874,7 +840,9 @@ router.post(
         // The external Stellar boundary is replaceable in test mode; without
         // an override, the submission is reported as unavailable.
         if (!voteExecutorOverride) {
-          return res.status(400).json({ error: "Simulation failed (test mode)" });
+          return res
+            .status(400)
+            .json({ error: "Simulation failed (test mode)" });
         }
         const execution = await voteExecutorOverride({
           daoId,
@@ -995,21 +963,13 @@ router.post(
         return { sendResult: sr, result: r };
       });
 
-      try {
-        const { jobId, status } = enqueueQueuedVote(queuePayload);
-        res.status(202).json({
-          success: true,
-          jobId,
-          status,
-          message: "Vote accepted for async processing",
-        });
-        return;
-      } catch (err) {
-        if ((err as Error).message === "VOTE_QUEUE_FULL") {
-          return res.status(429).json({ error: "Vote queue is full" });
-        }
-        throw err;
-      }
+      return respondToVoteExecution(
+        res,
+        { sendResult, result },
+        nullifier,
+        daoId,
+        proposalId,
+      );
     } catch (err) {
       if (nullifier) {
         updateTransactionLogStatus(nullifier, "FAILED");
@@ -1108,7 +1068,7 @@ router.get("/vote/status/:jobId", (req: Request, res: Response) => {
 router.post(
   "/vote/batch",
   bodyLimit("256kb"),
-  authGuard,
+  anonymousGuard,
   tlsClientCertGuard,
   walletRateLimiter,
   voteLimiter,
@@ -1528,35 +1488,44 @@ router.get(
 
         const operation = contract.call("get_root", ...args);
 
-        const account = await (server as StellarSdk.rpc.Server).getAccount(
-          relayerKeypair.publicKey(),
-        );
-        const tx = new StellarSdk.TransactionBuilder(account, {
-          fee: "100000",
-          networkPassphrase: config.networkPassphrase,
-        })
-          .addOperation(operation)
-          .setTimeout(30)
-          .build();
+        // The root becomes a proof witness, so it is read through the
+        // arbitrated path (#745): only endpoints within the finality-lag
+        // bound answer, the highest ledger wins, and two endpoints giving
+        // different roots for the same ledger fail closed. Not-found and
+        // empty results are part of the arbitrated value so endpoints must
+        // agree on those too.
+        const readRoot = async (srv: StellarSdk.rpc.Server) => {
+          const account = await srv.getAccount(relayerKeypair.publicKey());
+          const tx = new StellarSdk.TransactionBuilder(account, {
+            fee: "100000",
+            networkPassphrase: config.networkPassphrase,
+          })
+            .addOperation(operation)
+            .setTimeout(30)
+            .build();
 
-        const simResult = await (
-          server as StellarSdk.rpc.Server
-        ).simulateTransaction(tx);
+          const simResult = await srv.simulateTransaction(tx);
+          const ledger = Number((simResult as any).latestLedger ?? 0);
+          if (!StellarSdk.rpc.Api.isSimulationSuccess(simResult)) {
+            return { value: "DAO_NOT_FOUND", ledger };
+          }
+          const resultScVal = simResult.result?.retval;
+          if (!resultScVal) return { value: "NO_RESULT_RETURNED", ledger };
+          return { value: scValToU256Hex(resultScVal), ledger };
+        };
 
-        if (!StellarSdk.rpc.Api.isSimulationSuccess(simResult)) {
-          throw new Error("DAO_NOT_FOUND");
+        const { value } = config.testMode
+          ? await readRoot(server as StellarSdk.rpc.Server)
+          : await rpcPoolManager.readArbitrated((srv) =>
+              readRoot(srv as unknown as StellarSdk.rpc.Server),
+            );
+        if (value === "DAO_NOT_FOUND" || value === "NO_RESULT_RETURNED") {
+          throw new Error(value);
         }
-
-        const resultScVal = simResult.result?.retval;
-        if (!resultScVal) {
-          throw new Error("NO_RESULT_RETURNED");
-        }
-
-        const root = scValToU256Hex(resultScVal);
 
         return {
           daoId,
-          root,
+          root: value,
         };
       });
 
@@ -1565,6 +1534,19 @@ router.get(
       if (err instanceof ApiError) return next(err);
 
       const errMsg = (err as Error).message;
+      // Aggregate by reason; which DAO lives on the drill-down record (#749).
+      const reason =
+        errMsg === "DAO_NOT_FOUND"
+          ? "dao_not_found"
+          : errMsg === "NO_RESULT_RETURNED"
+            ? "no_result"
+            : "rpc_error";
+      incWithDrilldown(
+        rootFetchFailuresTotal,
+        { reason },
+        { dao_id: daoId },
+        { level: reason === "rpc_error" ? "error" : "warn" },
+      );
       if (errMsg === "DAO_NOT_FOUND") {
         return next(
           new ApiError(
@@ -1576,6 +1558,19 @@ router.get(
       } else if (errMsg === "NO_RESULT_RETURNED") {
         return next(
           new ApiError(500, ErrorCode.INTERNAL_ERROR, "No result returned"),
+        );
+      } else if (
+        err instanceof StaleReadError ||
+        err instanceof EndpointDisagreementError
+      ) {
+        // Refuse to hand out a root we cannot vouch for; clients retry.
+        log("warn", "root_fetch_unverified", { daoId, error: errMsg });
+        return next(
+          new ApiError(
+            503,
+            ErrorCode.SERVICE_UNAVAILABLE,
+            "Merkle root temporarily unverifiable; retry shortly",
+          ),
         );
       }
       log("error", "root_fetch_error", { daoId, error: errMsg });

@@ -1,7 +1,7 @@
 name: Lint and Security Checks
 
 on:
-  # Personal fork: manual-only to avoid automatic CI notifications.
+  # Personal fork: manually triggered only, no scheduled/push/PR runs.
   workflow_dispatch: {}
 jobs:
   lint:
